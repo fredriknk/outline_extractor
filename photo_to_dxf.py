@@ -3,9 +3,41 @@ import cv2
 import numpy as np
 import ezdxf
 
+# --- CONFIG ------------------------------------------------------------------
+
 A4_WIDTH_MM = 210
 A4_HEIGHT_MM = 297
-PIXELS_PER_MM = 10  # controls resolution of the warped A4 image
+
+# Lower value = smaller warped image (better for screens)
+PIXELS_PER_MM = 100
+
+# Max size of debug windows on screen
+MAX_DEBUG_WIDTH = 5000
+MAX_DEBUG_HEIGHT = 5000
+
+
+# --- UTILS -------------------------------------------------------------------
+
+def show_debug(name, img, wait=True):
+    """
+    Show an image in a window, automatically scaled down to fit on screen.
+    Press any key to continue if wait=True.
+    """
+    h, w = img.shape[:2]
+    scale = min(MAX_DEBUG_WIDTH / w, MAX_DEBUG_HEIGHT / h, 1.0)
+
+    if scale < 1.0:
+        img_disp = cv2.resize(img, (int(w * scale), int(h * scale)))
+    else:
+        img_disp = img
+
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.imshow(name, img_disp)
+
+    if wait:
+        cv2.waitKey(0)
+        cv2.destroyWindow(name)
+
 
 def order_points(pts):
     """
@@ -24,6 +56,8 @@ def order_points(pts):
     return rect
 
 
+# --- PAPER DETECTION + WARP --------------------------------------------------
+
 def find_paper_quad(image, debug=False):
     """
     Find the largest quadrilateral in the image (assumed to be the A4 paper).
@@ -34,11 +68,8 @@ def find_paper_quad(image, debug=False):
     edges = cv2.Canny(blur, 75, 200)
 
     if debug:
-        cv2.imshow("DEBUG: 00_gray", gray)
-        cv2.imshow("DEBUG: 01_edges", edges)
-        cv2.waitKey(0)
-        cv2.destroyWindow("DEBUG: 00_gray")
-        cv2.destroyWindow("DEBUG: 01_edges")
+        show_debug("DEBUG: 00_gray", gray)
+        show_debug("DEBUG: 01_edges", edges)
 
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -62,9 +93,7 @@ def find_paper_quad(image, debug=False):
     if debug:
         vis = image.copy()
         cv2.drawContours(vis, [best_quad], -1, (0, 0, 255), 3)
-        cv2.imshow("DEBUG: 02_original_with_paper_quad", vis)
-        cv2.waitKey(0)
-        cv2.destroyWindow("DEBUG: 02_original_with_paper_quad")
+        show_debug("DEBUG: 02_original_with_paper_quad", vis)
 
     return quad
 
@@ -91,12 +120,12 @@ def warp_to_a4(image, src_quad, debug=False):
     warped = cv2.warpPerspective(image, M, (width_px, height_px))
 
     if debug:
-        cv2.imshow("DEBUG: 03_warped_a4", warped)
-        cv2.waitKey(0)
-        cv2.destroyWindow("DEBUG: 03_warped_a4")
+        show_debug("DEBUG: 03_warped_a4", warped)
 
     return warped
 
+
+# --- THRESHOLD SLIDER --------------------------------------------------------
 
 def interactive_threshold(a4_image, debug=False):
     """
@@ -107,10 +136,11 @@ def interactive_threshold(a4_image, debug=False):
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
     if debug:
-        cv2.imshow("DEBUG: 04_a4_gray", gray)
+        show_debug("DEBUG: 04_a4_gray", gray)
 
     window_name = "Threshold (press Enter/q/Esc when happy)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, MAX_DEBUG_WIDTH, MAX_DEBUG_HEIGHT)
 
     def nothing(x):
         pass
@@ -121,7 +151,15 @@ def interactive_threshold(a4_image, debug=False):
         t = cv2.getTrackbarPos("thresh", window_name)
         _, thresh = cv2.threshold(gray, t, 255, cv2.THRESH_BINARY_INV)
 
-        cv2.imshow(window_name, thresh)
+        # Scale for display
+        h, w = thresh.shape[:2]
+        scale = min(MAX_DEBUG_WIDTH / w, MAX_DEBUG_HEIGHT / h, 1.0)
+        if scale < 1.0:
+            disp = cv2.resize(thresh, (int(w * scale), int(h * scale)))
+        else:
+            disp = thresh
+
+        cv2.imshow(window_name, disp)
 
         key = cv2.waitKey(30) & 0xFF
         if key in (13, 27, ord("q")):  # Enter, Esc, or q
@@ -129,11 +167,15 @@ def interactive_threshold(a4_image, debug=False):
             break
 
     cv2.destroyWindow(window_name)
+
     if debug:
-        cv2.destroyWindow("DEBUG: 04_a4_gray")
+        # Gray window already closed by show_debug, nothing extra needed
+        pass
 
     return chosen
 
+
+# --- OBJECT CONTOUR EXTRACTION ----------------------------------------------
 
 def extract_object_contour(a4_image, manual_threshold=None, debug=False):
     """
@@ -145,10 +187,12 @@ def extract_object_contour(a4_image, manual_threshold=None, debug=False):
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
     if manual_threshold is None:
+        # Automatic threshold (Otsu)
         _, thresh = cv2.threshold(
             blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
         )
     else:
+        # Manual threshold from slider
         _, thresh = cv2.threshold(
             blur, manual_threshold, 255, cv2.THRESH_BINARY_INV
         )
@@ -162,11 +206,8 @@ def extract_object_contour(a4_image, manual_threshold=None, debug=False):
     )
 
     if debug:
-        cv2.imshow("DEBUG: 05_thresh_raw", thresh)
-        cv2.imshow("DEBUG: 06_thresh_clean", thresh_clean)
-        cv2.waitKey(0)
-        cv2.destroyWindow("DEBUG: 05_thresh_raw")
-        cv2.destroyWindow("DEBUG: 06_thresh_clean")
+        show_debug("DEBUG: 05_thresh_raw", thresh)
+        show_debug("DEBUG: 06_thresh_clean", thresh_clean)
 
     if not contours:
         raise RuntimeError("No contours found on A4 paper; is the object visible?")
@@ -177,7 +218,7 @@ def extract_object_contour(a4_image, manual_threshold=None, debug=False):
         # Contour on threshold image
         thresh_color = cv2.cvtColor(thresh_clean, cv2.COLOR_GRAY2BGR)
         cv2.drawContours(thresh_color, [largest], -1, (0, 0, 255), 2)
-        cv2.imshow("DEBUG: 07_thresh_with_largest_contour", thresh_color)
+        show_debug("DEBUG: 07_thresh_with_largest_contour", thresh_color)
 
     # Approximate to reduce number of points
     peri = cv2.arcLength(largest, True)
@@ -187,13 +228,12 @@ def extract_object_contour(a4_image, manual_threshold=None, debug=False):
     if debug:
         a4_vis = a4_image.copy()
         cv2.drawContours(a4_vis, [approx], -1, (0, 0, 255), 2)
-        cv2.imshow("DEBUG: 08_a4_with_contour", a4_vis)
-        cv2.waitKey(0)
-        cv2.destroyWindow("DEBUG: 07_thresh_with_largest_contour")
-        cv2.destroyWindow("DEBUG: 08_a4_with_contour")
+        show_debug("DEBUG: 08_a4_with_contour", a4_vis)
 
     return approx.reshape(-1, 2)
 
+
+# --- COORDINATE CONVERSION + DXF --------------------------------------------
 
 def contour_to_mm(contour_points, flip_y=True):
     """
@@ -222,6 +262,8 @@ def save_contour_as_dxf(points_mm, output_path):
     doc.saveas(output_path)
 
 
+# --- MAIN PIPELINE ----------------------------------------------------------
+
 def process_image_to_dxf(input_image_path, output_dxf_path, use_slider=True, debug=False):
     image = cv2.imread(input_image_path)
     if image is None:
@@ -236,7 +278,7 @@ def process_image_to_dxf(input_image_path, output_dxf_path, use_slider=True, deb
     a4_topdown = warp_to_a4(image, paper_quad, debug=debug)
     print(f"[INFO] Warped A4 shape: {a4_topdown.shape}")
 
-    # 2. Get threshold (slider or auto)
+    # 2. Get threshold (slider or auto) and extract contour
     if use_slider:
         thr = interactive_threshold(a4_topdown, debug=debug)
         print(f"[INFO] Using manual threshold: {thr}")
@@ -257,6 +299,8 @@ def process_image_to_dxf(input_image_path, output_dxf_path, use_slider=True, deb
     # 4. Save as DXF
     save_contour_as_dxf(object_contour_mm, output_dxf_path)
 
+
+# --- CLI --------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
