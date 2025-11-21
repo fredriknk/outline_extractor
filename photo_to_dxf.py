@@ -9,7 +9,7 @@ A4_WIDTH_MM = 210
 A4_HEIGHT_MM = 297
 
 # Lower value = smaller warped image (better for screens)
-PIXELS_PER_MM = 4
+PIXELS_PER_MM = 10
 
 # Max size of debug windows on screen
 MAX_DEBUG_WIDTH = 1200
@@ -60,33 +60,77 @@ def order_points(pts):
 
 def find_paper_quad(image, debug=False):
     """
-    Find the largest quadrilateral in the image (assumed to be the A4 paper).
+    Detect the A4 sheet as the biggest bright rectangle.
+
+    Steps:
+      - grayscale + blur
+      - Otsu threshold to get bright regions (paper)
+      - cleanup with morphology
+      - largest contour with A4-ish aspect ratio
     Returns 4 points (float32).
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 75, 200)
+
+    # Paper is the brightest thing: THRESH_BINARY so paper becomes white (255)
+    _, thresh = cv2.threshold(
+        blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # Morphological closing to solidify the paper region
+    kernel = np.ones((7, 7), np.uint8)
+    thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     if debug:
         show_debug("DEBUG: 00_gray", gray)
-        show_debug("DEBUG: 01_edges", edges)
+        show_debug("DEBUG: 01_thresh_paper", thresh_clean)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    max_area = 0
+    if not contours:
+        raise RuntimeError("No contours found for paper")
+
+    img_h, img_w = gray.shape
+    img_area = img_w * img_h
+    target_aspect = max(A4_HEIGHT_MM, A4_WIDTH_MM) / min(A4_HEIGHT_MM, A4_WIDTH_MM)
+
     best_quad = None
+    best_score = -1.0
+
     for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 0.1 * img_area:
+            # Too small to be the paper
+            continue
+
+        # Approximate contour
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-        if len(approx) == 4:
-            area = cv2.contourArea(approx)
-            if area > max_area:
-                max_area = area
-                best_quad = approx
+        # If not 4 points, get a minimum-area rectangle instead
+        if len(approx) != 4:
+            rect = cv2.minAreaRect(cnt)
+            box = cv2.boxPoints(rect)
+            approx = box.reshape(-1, 1, 2).astype(np.int32)
+
+        # Bounding box to compute aspect ratio
+        x, y, w, h = cv2.boundingRect(approx)
+        if w == 0 or h == 0:
+            continue
+        ratio = max(w, h) / min(w, h)
+
+        # Score: big area and aspect ratio near A4
+        aspect_penalty = abs(ratio - target_aspect)
+        score = (area / img_area) - 0.5 * aspect_penalty
+
+        if score > best_score:
+            best_score = score
+            best_quad = approx
 
     if best_quad is None:
-        raise RuntimeError("Could not find A4 paper contour (quadrilateral) in image.")
+        raise RuntimeError("Could not find A4 paper contour.")
 
     quad = best_quad.reshape(4, 2).astype("float32")
 
@@ -151,6 +195,7 @@ def interactive_object_contour(a4_image, debug=False):
 
     chosen_t = 127
     chosen_contour = None
+    final_contour_vis = None
 
     while True:
         t = cv2.getTrackbarPos("thresh", window_name)
@@ -158,7 +203,7 @@ def interactive_object_contour(a4_image, debug=False):
         # Threshold & clean
         _, thresh = cv2.threshold(blur, t, 255, cv2.THRESH_BINARY_INV)
         kernel = np.ones((3, 3), np.uint8)
-        thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=10)
 
         # Find contours
         contours, _ = cv2.findContours(
@@ -176,6 +221,7 @@ def interactive_object_contour(a4_image, debug=False):
 
             chosen_contour = approx.reshape(-1, 2)
             chosen_t = t
+            final_contour_vis = contour_vis
 
         # Build side-by-side view: [binary | contour overlay]
         thresh_vis = cv2.cvtColor(thresh_clean, cv2.COLOR_GRAY2BGR)
@@ -200,8 +246,8 @@ def interactive_object_contour(a4_image, debug=False):
     if chosen_contour is None:
         raise RuntimeError("No contour found with chosen threshold")
 
-    if debug:
-        show_debug("DEBUG: 08_a4_with_final_contour", contour_vis)
+    if debug and final_contour_vis is not None:
+        show_debug("DEBUG: 08_a4_with_final_contour", final_contour_vis)
 
     print(f"[INFO] Final manual threshold: {chosen_t}")
     return chosen_contour
@@ -323,7 +369,7 @@ def main():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Show debug windows for intermediate steps (paper detection).",
+        help="Show debug windows for intermediate steps (paper detection & contour).",
     )
 
     args = parser.parse_args()
