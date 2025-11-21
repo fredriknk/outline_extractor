@@ -12,8 +12,8 @@ A4_HEIGHT_MM = 297
 PIXELS_PER_MM = 4
 
 # Max size of debug / interactive windows on screen
-MAX_DEBUG_WIDTH = 1200
-MAX_DEBUG_HEIGHT = 800
+MAX_DEBUG_WIDTH = 1800
+MAX_DEBUG_HEIGHT = 1200
 
 
 # --- UTILS -------------------------------------------------------------------
@@ -78,7 +78,7 @@ def find_paper_quad(image, debug=False):
     _, otsu = cv2.threshold(
         blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
-    start_t = int(np.mean(blur[otsu == 255])) if np.any(otsu == 255) else 180
+    start_t = 119#int(np.mean(blur[otsu == 255])) if np.any(otsu == 255) else 119
     start_t = max(0, min(255, start_t))
 
     window_name = "Paper threshold (Enter/q/Esc to accept)"
