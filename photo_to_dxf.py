@@ -9,7 +9,7 @@ A4_WIDTH_MM = 210
 A4_HEIGHT_MM = 297
 
 # Lower value = smaller warped image (better for screens)
-PIXELS_PER_MM = 10
+PIXELS_PER_MM = 5
 
 # Max size of debug windows on screen
 MAX_DEBUG_WIDTH = 1200
@@ -57,89 +57,130 @@ def order_points(pts):
 
 
 # --- PAPER DETECTION + WARP --------------------------------------------------
-
 def find_paper_quad(image, debug=False):
     """
-    Detect the A4 sheet as the biggest bright rectangle.
+    Detect the A4 sheet as the biggest bright rectangle, using an interactive
+    threshold slider.
 
-    Steps:
-      - grayscale + blur
-      - Otsu threshold to get bright regions (paper)
-      - cleanup with morphology
-      - largest contour with A4-ish aspect ratio
-    Returns 4 points (float32).
+    Each slider move:
+      - thresholds the image (paper = white)
+      - does morphology to solidify the paper
+      - finds the largest A4-ish contour
+      - shows [binary mask | original with red quad]
+
+    When you press Enter / q / Esc, the last valid quad is returned.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # Paper is the brightest thing: THRESH_BINARY so paper becomes white (255)
-    _, thresh = cv2.threshold(
+    # Start value from Otsu, but allow manual adjustment
+    _, otsu = cv2.threshold(
         blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
+    # Otsu threshold is the value in the threshold operation; we can
+    # approximate it by looking at the histogram threshold.
+    # Simpler: estimate as mean of pixels that became white in otsu result.
+    start_t = int(np.mean(blur[otsu == 255])) if np.any(otsu == 255) else 180
+    start_t = max(0, min(255, start_t))
 
-    # Morphological closing to solidify the paper region
-    kernel = np.ones((7, 7), np.uint8)
-    thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    window_name = "Paper threshold (Enter/q/Esc to accept)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, MAX_DEBUG_WIDTH, MAX_DEBUG_HEIGHT)
 
-    if debug:
-        show_debug("DEBUG: 00_gray", gray)
-        show_debug("DEBUG: 01_thresh_paper", thresh_clean)
+    def nothing(x):
+        pass
 
-    contours, _ = cv2.findContours(
-        thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        raise RuntimeError("No contours found for paper")
+    cv2.createTrackbar("thresh", window_name, start_t, 255, nothing)
 
     img_h, img_w = gray.shape
     img_area = img_w * img_h
     target_aspect = max(A4_HEIGHT_MM, A4_WIDTH_MM) / min(A4_HEIGHT_MM, A4_WIDTH_MM)
 
-    best_quad = None
-    best_score = -1.0
+    chosen_quad = None
+    chosen_t = start_t
+    final_vis = None
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 0.1 * img_area:
-            # Too small to be the paper
-            continue
+    while True:
+        t = cv2.getTrackbarPos("thresh", window_name)
 
-        # Approximate contour
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        # Paper is bright → THRESH_BINARY (paper = white)
+        _, thresh = cv2.threshold(blur, t, 255, cv2.THRESH_BINARY)
 
-        # If not 4 points, get a minimum-area rectangle instead
-        if len(approx) != 4:
-            rect = cv2.minAreaRect(cnt)
-            box = cv2.boxPoints(rect)
-            approx = box.reshape(-1, 1, 2).astype(np.int32)
+        # Morphological closing to solidify the paper region
+        kernel = np.ones((7, 7), np.uint8)
+        thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        # Bounding box to compute aspect ratio
-        x, y, w, h = cv2.boundingRect(approx)
-        if w == 0 or h == 0:
-            continue
-        ratio = max(w, h) / min(w, h)
+        # Find external contours on the bright mask
+        contours, _ = cv2.findContours(
+            thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
-        # Score: big area and aspect ratio near A4
-        aspect_penalty = abs(ratio - target_aspect)
-        score = (area / img_area) - 0.5 * aspect_penalty
+        best_quad = None
+        best_score = -1.0
 
-        if score > best_score:
-            best_score = score
-            best_quad = approx
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 0.1 * img_area:
+                # Too small to be the paper
+                continue
 
-    if best_quad is None:
-        raise RuntimeError("Could not find A4 paper contour.")
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-    quad = best_quad.reshape(4, 2).astype("float32")
+            # If not 4 points, use min-area rectangle
+            if len(approx) != 4:
+                rect = cv2.minAreaRect(cnt)
+                box = cv2.boxPoints(rect)
+                approx = box.reshape(-1, 1, 2).astype(np.int32)
 
-    if debug:
-        vis = image.copy()
-        cv2.drawContours(vis, [best_quad], -1, (0, 0, 255), 3)
-        show_debug("DEBUG: 02_original_with_paper_quad", vis)
+            x, y, w, h = cv2.boundingRect(approx)
+            if w == 0 or h == 0:
+                continue
+            ratio = max(w, h) / min(w, h)
 
-    return quad
+            aspect_penalty = abs(ratio - target_aspect)
+            score = (area / img_area) - 0.5 * aspect_penalty
+
+            if score > best_score:
+                best_score = score
+                best_quad = approx
+
+        # Build visualization
+        thresh_vis = cv2.cvtColor(thresh_clean, cv2.COLOR_GRAY2BGR)
+        contour_vis = image.copy()
+
+        if best_quad is not None:
+            cv2.drawContours(contour_vis, [best_quad], -1, (0, 0, 255), 3)
+            chosen_quad = best_quad.reshape(4, 2).astype("float32")
+            chosen_t = t
+            final_vis = contour_vis
+
+        combined = np.hstack((thresh_vis, contour_vis))
+
+        # Scale for display
+        h, w = combined.shape[:2]
+        scale = min(MAX_DEBUG_WIDTH / w, MAX_DEBUG_HEIGHT / h, 1.0)
+        if scale < 1.0:
+            disp = cv2.resize(combined, (int(w * scale), int(h * scale)))
+        else:
+            disp = combined
+
+        cv2.imshow(window_name, disp)
+
+        key = cv2.waitKey(30) & 0xFF
+        if key in (13, 27, ord("q")):  # Enter, Esc, q
+            break
+
+    cv2.destroyWindow(window_name)
+
+    if chosen_quad is None:
+        raise RuntimeError("Could not find A4 paper contour with chosen threshold.")
+
+    if debug and final_vis is not None:
+        show_debug("DEBUG: 02_original_with_paper_quad", final_vis)
+
+    print(f"[INFO] Final paper threshold: {chosen_t}")
+    return chosen_quad
 
 
 def warp_to_a4(image, src_quad, debug=False):
