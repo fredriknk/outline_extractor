@@ -211,7 +211,7 @@ def warp_to_a4(image, src_quad, debug=False):
 # --- INTERACTIVE OBJECT CONTOUR (ADVANCED SLIDERS) --------------------------
 def interactive_object_contour(a4_image, debug=False):
     """
-    Advanced interactive object detection with multiple sliders and click-to-remove:
+    Advanced interactive object detection with paint tools:
 
     Trackbars:
       - mode:
@@ -222,66 +222,108 @@ def interactive_object_contour(a4_image, debug=False):
       - morph: morphology strength (kernel size)
       - eps_x10000: contour approximation factor
             epsilon = eps_x10000 / 10000 * perimeter
+      - brush: brush radius in pixels for painting
+      - zoom: zoom factor * 0.1 (1.0–4.0), zooms around last clicked point
 
     Mouse:
-      - Left-click on the LEFT (mask) pane: erase that area from the mask
-      - Right-click: clear all manual erasures
+      - Left click + drag  on LEFT (mask) pane  -> erase (remove from object)
+      - Right click + drag on LEFT (mask) pane  -> add   (add to object)
+      - Any click also recenters zoom on that point
+
+    Keys:
+      - Z or Ctrl+Z -> undo last paint stroke
+      - R           -> reset all painting
+      - Enter / q / Esc -> accept contour and return it
     """
     gray = cv2.cvtColor(a4_image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    h0, w0 = gray.shape
+    mask_h, mask_w = gray.shape
 
-    # Mask where clicks will "cut out" regions (1-channel, same size as mask)
-    removal_mask = np.zeros_like(gray, dtype=np.uint8)
+    # Masks for user painting
+    removal_mask = np.zeros_like(gray, dtype=np.uint8)  # 255 = forced remove
+    add_mask = np.zeros_like(gray, dtype=np.uint8)      # 255 = forced add
 
-    window_name = "Object detect (mode, thresh, morph, eps) – LMB erase, RMB reset, Enter/q/Esc to accept"
+    # History for undo (stack of (removal_mask, add_mask))
+    history = []
+
+    window_name = "Object detect – paint (LMB erase, RMB add, Z undo, R reset, Enter/q/Esc)"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, MAX_DEBUG_WIDTH, MAX_DEBUG_HEIGHT)
 
     def nothing(x):
         pass
 
-    # mode 0..2
-    cv2.createTrackbar("mode", window_name, 2, 2, nothing)
-    cv2.createTrackbar("thresh", window_name, 120, 255, nothing)
-    cv2.createTrackbar("morph", window_name, 5, 10, nothing)
-    # finer control: divide by 10000 instead of 1000
-    cv2.createTrackbar("eps_x10000", window_name, 3, 50, nothing)
+    cv2.createTrackbar("mode",        window_name, 2, 2,   nothing)
+    cv2.createTrackbar("thresh",      window_name, 120, 255, nothing)
+    cv2.createTrackbar("morph",       window_name, 2, 10,  nothing)
+    cv2.createTrackbar("eps_x10000",  window_name, 5, 50, nothing)  # finer control
+    cv2.createTrackbar("brush",       window_name, 15, 80, nothing)   # brush radius
+    cv2.createTrackbar("zoom",        window_name, 10, 40, nothing)   # 10→1.0, 40→4.0
 
-    # Info passed to mouse callback for coordinate mapping
+    # Info shared with mouse callback
     display_info = {
         "scale": 1.0,
-        "mask_w": w0,
-        "mask_h": h0,
+        "roi_x": 0,
+        "roi_y": 0,
+        "mask_w": mask_w,
+        "mask_h": mask_h,
+        "zoom_cx": mask_w,      # start near center of mask pane
+        "zoom_cy": mask_h // 2,
     }
 
+    def push_history():
+        # Keep at most ~30 steps
+        if len(history) >= 30:
+            history.pop(0)
+        history.append((removal_mask.copy(), add_mask.copy()))
+
     def on_mouse(event, x, y, flags, param):
-        nonlocal removal_mask
-        if event == cv2.EVENT_LBUTTONDOWN:
-            # Map from display coords -> combined coords -> mask coords
-            scale = max(display_info["scale"], 1e-6)
-            cx = int(x / scale)
-            cy = int(y / scale)
+        nonlocal removal_mask, add_mask, history
+        # Map window coords -> combined image coords -> mask coords
+        scale = max(display_info["scale"], 1e-6)
+        rx = int(x / scale)
+        ry = int(y / scale)
+        gx = display_info["roi_x"] + rx
+        gy = display_info["roi_y"] + ry
 
-            mask_w = display_info["mask_w"]
-            mask_h = display_info["mask_h"]
+        mask_w = display_info["mask_w"]
+        mask_h = display_info["mask_h"]
 
-            # Combined image is [mask | contour] -> width = 2 * mask_w
-            if cx < 0 or cy < 0 or cy >= mask_h or cx >= 2 * mask_w:
-                return
+        # Combined image is [mask | contour] → width = 2*mask_w
+        if gx < 0 or gy < 0 or gy >= mask_h or gx >= 2 * mask_w:
+            return
 
-            # Only accept clicks in the left (mask) pane
-            if cx >= mask_w:
-                return
+        # Only paint in left (mask) pane
+        if gx >= mask_w:
+            return
 
-            mx, my = cx, cy
-            radius = 20  # erase radius in pixels
-            cv2.circle(removal_mask, (mx, my), radius, 255, -1)  # mark for removal
+        mx, my = gx, gy
 
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            # Reset all manual erasures
-            removal_mask[:] = 0
+        # Update zoom center on any button down
+        if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+            display_info["zoom_cx"] = mx
+            display_info["zoom_cy"] = my
+
+        brush_r = cv2.getTrackbarPos("brush", window_name)
+        brush_r = max(1, brush_r)
+
+        # Start stroke -> push history
+        if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+            push_history()
+
+        # Continuous painting while dragging
+        if (event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON)) or \
+           event == cv2.EVENT_LBUTTONDOWN:
+            # Erase: mark removal_mask, clear add_mask there
+            cv2.circle(removal_mask, (mx, my), brush_r, 255, -1)
+            cv2.circle(add_mask, (mx, my), brush_r, 0,   -1)
+
+        elif (event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_RBUTTON)) or \
+             event == cv2.EVENT_RBUTTONDOWN:
+            # Add: mark add_mask, clear removal_mask there
+            cv2.circle(add_mask, (mx, my), brush_r, 255, -1)
+            cv2.circle(removal_mask, (mx, my), brush_r, 0,   -1)
 
     cv2.setMouseCallback(window_name, on_mouse)
 
@@ -289,17 +331,18 @@ def interactive_object_contour(a4_image, debug=False):
     final_vis = None
 
     while True:
-        mode = cv2.getTrackbarPos("mode", window_name)
-        t = cv2.getTrackbarPos("thresh", window_name)
-        morph = cv2.getTrackbarPos("morph", window_name)
-        epsk = cv2.getTrackbarPos("eps_x10000", window_name)
+        mode  = cv2.getTrackbarPos("mode",       window_name)
+        t     = cv2.getTrackbarPos("thresh",     window_name)
+        morph = cv2.getTrackbarPos("morph",      window_name)
+        epsk  = cv2.getTrackbarPos("eps_x10000", window_name)
+        zooms = cv2.getTrackbarPos("zoom",       window_name)
 
         morph = max(1, morph)
-        epsk = max(1, epsk)
+        epsk  = max(1, epsk)
+        zoom_factor = max(1.0, zooms / 10.0)  # 10→1.0, 40→4.0
 
-        # Build mask depending on mode
+        # --- Build base mask from sliders ------------------------------------
         if mode in (0, 1):
-            # Global threshold
             if mode == 0:
                 # dark object on light background
                 _, mask = cv2.threshold(blur, t, 255, cv2.THRESH_BINARY_INV)
@@ -310,7 +353,6 @@ def interactive_object_contour(a4_image, debug=False):
             ksize = 2 * morph + 1
             kernel = np.ones((ksize, ksize), np.uint8)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
         else:
             # Canny edge mode
             high = max(10, t)
@@ -321,21 +363,20 @@ def interactive_object_contour(a4_image, debug=False):
             kernel = np.ones((ksize, ksize), np.uint8)
             mask = cv2.dilate(edges, kernel, iterations=1)
 
-        # Apply manual erasures: anywhere removal_mask > 0 becomes background
+        # Apply user painting
         mask[removal_mask > 0] = 0
+        mask[add_mask > 0] = 255
 
-        # Find contours on the mask
+        # --- Contour detection ----------------------------------------------
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         contour_vis = a4_image.copy()
-
         if contours:
             largest = max(contours, key=cv2.contourArea)
-
             peri = cv2.arcLength(largest, True)
-            epsilon = (epsk / 10000.0) * peri  # finer poly control
+            epsilon = (epsk / 10000.0) * peri
             approx = cv2.approxPolyDP(largest, epsilon, True)
 
             cv2.drawContours(contour_vis, [approx], -1, (0, 0, 255), 2)
@@ -343,15 +384,15 @@ def interactive_object_contour(a4_image, debug=False):
             chosen_contour = approx.reshape(-1, 2)
             final_vis = contour_vis
         elif chosen_contour is not None:
-            # No contour this frame, but keep showing last good one
+            # No contour this frame, keep last good one visible
             cc = chosen_contour.reshape(-1, 1, 2)
             cv2.drawContours(contour_vis, [cc], -1, (0, 0, 255), 2)
 
-        # Build side-by-side view: [mask | contour overlay]
+        # --- Build side-by-side & apply zoom --------------------------------
         mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         cv2.putText(
             mask_vis,
-            "LMB erase, RMB reset",
+            "LMB erase, RMB add, Z undo, R reset",
             (10, 20),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -361,25 +402,56 @@ def interactive_object_contour(a4_image, debug=False):
         )
 
         combined = np.hstack((mask_vis, contour_vis))
+        ch, cw = combined.shape[:2]
 
-        # Scale for window
-        h, w = combined.shape[:2]
-        scale = min(MAX_DEBUG_WIDTH / w, MAX_DEBUG_HEIGHT / h, 1.0)
+        # Determine ROI for zoom
+        cx = display_info["zoom_cx"]
+        cy = display_info["zoom_cy"]
+        cx = int(np.clip(cx, 0, 2 * mask_w - 1))
+        cy = int(np.clip(cy, 0, mask_h - 1))
+
+        view_w = int(cw / zoom_factor)
+        view_h = int(ch / zoom_factor)
+        view_w = max(1, min(cw, view_w))
+        view_h = max(1, min(ch, view_h))
+
+        x0 = int(cx - view_w // 2)
+        y0 = int(cy - view_h // 2)
+        x0 = max(0, min(cw - view_w, x0))
+        y0 = max(0, min(ch - view_h, y0))
+
+        roi = combined[y0:y0 + view_h, x0:x0 + view_w]
+
+        # Scale ROI to window
+        scale = min(MAX_DEBUG_WIDTH / view_w, MAX_DEBUG_HEIGHT / view_h, 1.0)
         if scale < 1.0:
-            disp = cv2.resize(combined, (int(w * scale), int(h * scale)))
+            disp = cv2.resize(roi, (int(view_w * scale), int(view_h * scale)))
         else:
-            disp = combined
+            disp = roi
 
-        # update mapping info for the mouse callback
+        # Update mapping for mouse callback
         display_info["scale"] = scale
-        display_info["mask_w"] = w0
-        display_info["mask_h"] = h0
+        display_info["roi_x"] = x0
+        display_info["roi_y"] = y0
 
         cv2.imshow(window_name, disp)
 
         key = cv2.waitKey(30) & 0xFF
+
+        # Accept
         if key in (13, 27, ord("q")):  # Enter, Esc, q
             break
+
+        # Undo: Z or Ctrl+Z (26)
+        if key in (ord("z"), ord("Z"), 26):
+            if history:
+                removal_mask, add_mask = history.pop()
+
+        # Reset painting
+        if key in (ord("r"), ord("R")):
+            removal_mask[:] = 0
+            add_mask[:] = 0
+            history.clear()
 
     cv2.destroyWindow(window_name)
 
@@ -390,6 +462,7 @@ def interactive_object_contour(a4_image, debug=False):
         show_debug("DEBUG: final_object_contour", final_vis)
 
     return chosen_contour
+
 
 
 
