@@ -8,10 +8,10 @@ import ezdxf
 A4_WIDTH_MM = 210
 A4_HEIGHT_MM = 297
 
-# Lower value = smaller warped image (better for screens)
-PIXELS_PER_MM = 5
+# Working resolution for the warped A4 (pixels per mm)
+PIXELS_PER_MM = 4
 
-# Max size of debug windows on screen
+# Max size of debug / interactive windows on screen
 MAX_DEBUG_WIDTH = 1200
 MAX_DEBUG_HEIGHT = 800
 
@@ -57,6 +57,7 @@ def order_points(pts):
 
 
 # --- PAPER DETECTION + WARP --------------------------------------------------
+
 def find_paper_quad(image, debug=False):
     """
     Detect the A4 sheet as the biggest bright rectangle, using an interactive
@@ -77,9 +78,6 @@ def find_paper_quad(image, debug=False):
     _, otsu = cv2.threshold(
         blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
-    # Otsu threshold is the value in the threshold operation; we can
-    # approximate it by looking at the histogram threshold.
-    # Simpler: estimate as mean of pixels that became white in otsu result.
     start_t = int(np.mean(blur[otsu == 255])) if np.any(otsu == 255) else 180
     start_t = max(0, min(255, start_t))
 
@@ -145,7 +143,7 @@ def find_paper_quad(image, debug=False):
                 best_score = score
                 best_quad = approx
 
-        # Build visualization
+        # Visualisation
         thresh_vis = cv2.cvtColor(thresh_clean, cv2.COLOR_GRAY2BGR)
         contour_vis = image.copy()
 
@@ -210,63 +208,95 @@ def warp_to_a4(image, src_quad, debug=False):
     return warped
 
 
-# --- INTERACTIVE OBJECT CONTOUR (SLIDER) ------------------------------------
+# --- INTERACTIVE OBJECT CONTOUR (ADVANCED SLIDERS) --------------------------
 
 def interactive_object_contour(a4_image, debug=False):
     """
-    Use a slider to control the threshold used for object detection.
-    Each slider move:
-      - thresholds
-      - cleans noise
-      - finds largest contour
-      - shows [binary mask | contour on A4]
-    When user presses Enter / q / Esc, returns that contour (in pixels).
+    Advanced interactive object detection with multiple sliders:
+
+    Trackbars:
+      - mode:
+          0: dark object on light paper (binary INV)
+          1: light object on dark background (binary)
+          2: edge mode (Canny)
+      - thresh: threshold (0–255) or Canny high threshold
+      - morph: morphology strength (kernel size)
+      - eps_x1000: contour approximation factor (epsilon = eps_x1000/1000 * perimeter)
     """
     gray = cv2.cvtColor(a4_image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    window_name = "Object threshold (Enter/q/Esc to accept)"
+    window_name = "Object detect (mode, thresh, morph, eps) – Enter/q/Esc to accept"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, MAX_DEBUG_WIDTH, MAX_DEBUG_HEIGHT)
 
     def nothing(x):
         pass
 
-    cv2.createTrackbar("thresh", window_name, 127, 255, nothing)
+    # mode 0..2
+    cv2.createTrackbar("mode", window_name, 0, 2, nothing)
+    cv2.createTrackbar("thresh", window_name, 120, 255, nothing)
+    cv2.createTrackbar("morph", window_name, 2, 10, nothing)
+    cv2.createTrackbar("eps_x10000", window_name, 5, 50, nothing)
 
-    chosen_t = 127
     chosen_contour = None
-    final_contour_vis = None
+    final_vis = None
 
     while True:
+        mode = cv2.getTrackbarPos("mode", window_name)
         t = cv2.getTrackbarPos("thresh", window_name)
+        morph = cv2.getTrackbarPos("morph", window_name)
+        epsk = cv2.getTrackbarPos("eps_x10000", window_name)
 
-        # Threshold & clean
-        _, thresh = cv2.threshold(blur, t, 255, cv2.THRESH_BINARY_INV)
-        kernel = np.ones((3, 3), np.uint8)
-        thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=10)
+        morph = max(1, morph)
+        epsk = max(1, epsk)
 
-        # Find contours
+        # Build mask depending on mode
+        if mode in (0, 1):
+            # Global threshold
+            if mode == 0:
+                # dark object on light background
+                _, mask = cv2.threshold(blur, t, 255, cv2.THRESH_BINARY_INV)
+            else:
+                # light object on dark background
+                _, mask = cv2.threshold(blur, t, 255, cv2.THRESH_BINARY)
+
+            ksize = 2 * morph + 1
+            kernel = np.ones((ksize, ksize), np.uint8)
+            # small opening to remove noise/shadows
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        else:
+            # Canny edge mode
+            high = max(10, t)
+            low = high // 2
+            edges = cv2.Canny(blur, low, high)
+
+            ksize = 2 * morph + 1
+            kernel = np.ones((ksize, ksize), np.uint8)
+            # thicken edges a bit
+            mask = cv2.dilate(edges, kernel, iterations=1)
+
+        # Find contours on the mask
         contours, _ = cv2.findContours(
-            thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
         contour_vis = a4_image.copy()
         if contours:
             largest = max(contours, key=cv2.contourArea)
-            # Approximate contour – decrease epsilon if you want more points
+
             peri = cv2.arcLength(largest, True)
-            epsilon = 0.005 * peri  # finer than 0.01
+            epsilon = (epsk / 10000.0) * peri  # more control over poly detail
             approx = cv2.approxPolyDP(largest, epsilon, True)
+
             cv2.drawContours(contour_vis, [approx], -1, (0, 0, 255), 2)
 
             chosen_contour = approx.reshape(-1, 2)
-            chosen_t = t
-            final_contour_vis = contour_vis
+            final_vis = contour_vis
 
-        # Build side-by-side view: [binary | contour overlay]
-        thresh_vis = cv2.cvtColor(thresh_clean, cv2.COLOR_GRAY2BGR)
-        combined = np.hstack((thresh_vis, contour_vis))
+        mask_vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        combined = np.hstack((mask_vis, contour_vis))
 
         # Scale for window
         h, w = combined.shape[:2]
@@ -285,18 +315,17 @@ def interactive_object_contour(a4_image, debug=False):
     cv2.destroyWindow(window_name)
 
     if chosen_contour is None:
-        raise RuntimeError("No contour found with chosen threshold")
+        raise RuntimeError("No contour found with chosen settings")
 
-    if debug and final_contour_vis is not None:
-        show_debug("DEBUG: 08_a4_with_final_contour", final_contour_vis)
+    if debug and final_vis is not None:
+        show_debug("DEBUG: final_object_contour", final_vis)
 
-    print(f"[INFO] Final manual threshold: {chosen_t}")
     return chosen_contour
 
 
 def auto_object_contour(a4_image, debug=False):
     """
-    Automatic object contour detection (Otsu threshold), no slider.
+    Simple automatic object contour detection (Otsu threshold), no sliders.
     """
     gray = cv2.cvtColor(a4_image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -370,19 +399,19 @@ def process_image_to_dxf(input_image_path, output_dxf_path, use_slider=True, deb
 
     print(f"[INFO] Image shape: {image.shape}")
 
-    # 1. Find and warp the A4 paper
+    # 1. Find and warp the A4 paper (with paper slider)
     paper_quad = find_paper_quad(image, debug=debug)
     print(f"[INFO] Paper quad: {paper_quad}")
 
     a4_topdown = warp_to_a4(image, paper_quad, debug=debug)
     print(f"[INFO] Warped A4 shape: {a4_topdown.shape}")
 
-    # 2. Object contour (slider or auto)
+    # 2. Object contour (advanced slider or auto)
     if use_slider:
-        print("[INFO] Using interactive threshold/contour slider")
+        print("[INFO] Using advanced interactive object detection")
         object_contour_px = interactive_object_contour(a4_topdown, debug=debug)
     else:
-        print("[INFO] Using automatic Otsu threshold")
+        print("[INFO] Using automatic object detection (Otsu)")
         object_contour_px = auto_object_contour(a4_topdown, debug=debug)
 
     print(f"[INFO] Contour has {len(object_contour_px)} points")
@@ -405,12 +434,12 @@ def main():
     parser.add_argument(
         "--no-slider",
         action="store_true",
-        help="Disable interactive slider and use automatic threshold instead.",
+        help="Disable interactive object slider and use automatic detection instead.",
     )
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Show debug windows for intermediate steps (paper detection & contour).",
+        help="Show debug windows for intermediate steps.",
     )
 
     args = parser.parse_args()
